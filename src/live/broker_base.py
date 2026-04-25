@@ -42,3 +42,10 @@ class BrokerBase(Protocol):
     ) -> Optional[LivePosition]: ...
 
     def close(self, symbol: str, price: float, reason: str) -> Optional[LiveTrade]: ...
+
+    def update_stop(self, symbol: str, new_stop: float) -> bool:
+        """Tighten the stop on an open position. Implementations should
+        update local state and (if applicable) replace the exchange-side
+        stop order. Return True on success.
+        """
+        ...

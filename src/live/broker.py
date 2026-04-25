@@ -33,6 +33,11 @@ class LivePosition:
     rationale: str = ""
     leverage: int = 1       # 1x = spot / no leverage; >1 = futures
     margin_used: float = 0.0  # quote currency margin locked (= notional / leverage)
+    algo_id: str = ""       # exchange-side OCO TP/SL algo id (futures brokers)
+    # trailing-stop bookkeeping — high_water for longs, low_water for shorts
+    high_water_mark: float = 0.0
+    low_water_mark: float = 0.0
+    trailing_active: bool = False
 
 
 @dataclass
@@ -249,6 +254,16 @@ class PaperBroker:
         if len(self.state.equity_history) > 10_000:
             self.state.equity_history = self.state.equity_history[-10_000:]
         self._save()
+
+    def update_stop(self, symbol: str, new_stop: float) -> bool:
+        """Paper broker: just rewrite the local stop level."""
+        pos = self.state.positions.get(symbol)
+        if pos is None:
+            return False
+        pos.stop = new_stop
+        pos.trailing_active = True
+        self._save()
+        return True
 
     def reset(self, starting_equity: Optional[float] = None):
         if starting_equity is not None:

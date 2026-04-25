@@ -30,8 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import requests
+
 from .broker import LivePosition, LiveTrade, PortfolioState
-from .okx_auth import OkxCreds, request
+from .okx_auth import OKX_BASE, OkxCreds, request
 from .okx_feed import symbol_to_okx
 
 log = logging.getLogger("ai-trader.okx-swap")
@@ -51,14 +53,17 @@ class OkxSwapBroker:
         creds: Optional[OkxCreds] = None,
         position_mode: str = "long_short_mode",
         margin_mode: str = "isolated",
+        margin_buffer: float = 0.85,   # use ≤85% of reported availBal for sizing
     ):
         self.state_path = Path(state_path)
         self.quote_ccy = quote_ccy
         self.creds = creds or OkxCreds.from_env()
         self.position_mode = position_mode
         self.margin_mode = margin_mode
+        self.margin_buffer = margin_buffer
         self._inst_cache: Dict[str, dict] = {}
         self._lev_cache: Dict[tuple, int] = {}   # (instId, posSide) -> lever
+        self._margin_exhausted: bool = False     # set by 51008, reset each tick
         self.state = self._load()
         if not self.creds.demo:
             log.warning("OkxSwapBroker running in LIVE mode — real money + leverage at risk")
@@ -138,7 +143,7 @@ class OkxSwapBroker:
         except Exception as e:
             log.warning("position-mode check/set failed (continuing): %s", e)
 
-    def _sync_cash_from_exchange(self):
+    def _sync_cash_from_exchange(self, quiet: bool = False):
         try:
             payload = request("GET", "/api/v5/account/balance", self.creds, params={"ccy": self.quote_ccy})
             details = (payload["data"][0] or {}).get("details") if payload.get("data") else []
@@ -149,10 +154,16 @@ class OkxSwapBroker:
                     if self.state.starting_equity <= 0:
                         self.state.starting_equity = avail
                     self._save()
-                    log.info("OKX swap cash synced: %.2f %s", avail, self.quote_ccy)
+                    if not quiet:
+                        log.info("OKX swap cash synced: %.2f %s", avail, self.quote_ccy)
                     return
         except Exception as e:
             log.warning("failed to sync OKX swap cash: %s", e)
+
+    def refresh_balance(self):
+        """Pull latest availBal from OKX and reset the per-tick exhausted flag."""
+        self._margin_exhausted = False
+        self._sync_cash_from_exchange(quiet=True)
 
     def _set_leverage(self, symbol: str, leverage: int, pos_side: str):
         inst_id = self._swap_inst_id(symbol)
@@ -189,6 +200,96 @@ class OkxSwapBroker:
     def _units_from_contracts(self, symbol: str, contracts: float) -> float:
         info = self._get_instrument(symbol)
         return float(contracts) * float(info.get("ctVal") or "1")
+
+    # ---- TP/SL (native OCO algo) ----------------------------------------
+    def _place_oco_tp_sl(
+        self,
+        symbol: str,
+        pos_side: str,
+        contracts: int,
+        tp_price: float,
+        sl_price: float,
+        trigger_type: str = "last",
+    ) -> Optional[str]:
+        """Attach an OCO algo order that will close the position at TP or SL.
+
+        Returns the OKX algoId, or None on failure (caller decides whether
+        to abort or proceed without exchange-side protection).
+        """
+        inst_id = self._swap_inst_id(symbol)
+        # closing side is opposite of position direction
+        order_side = "sell" if pos_side == "long" else "buy"
+
+        # round to instrument tick size to avoid -51000 errors. Important:
+        # decode decimals from the ORIGINAL tickSz string — float() turns
+        # small ticks like "0.00001" into "1e-05" which breaks naive parsing.
+        tick_str = str(self._get_instrument(symbol).get("tickSz") or "0.01")
+        tick_sz = float(tick_str)
+        if "e-" in tick_str.lower():
+            decimals = int(tick_str.lower().split("e-")[1])
+        elif "." in tick_str:
+            decimals = len(tick_str.split(".")[-1].rstrip("0")) or len(tick_str.split(".")[-1])
+        else:
+            decimals = 0
+        def _round_tick(p: float) -> str:
+            n = round(p / tick_sz)
+            return f"{n * tick_sz:.{decimals}f}"
+
+        body = {
+            "instId": inst_id,
+            "tdMode": self.margin_mode,
+            "side": order_side,
+            "posSide": pos_side,
+            "ordType": "oco",
+            "sz": str(contracts),
+            "reduceOnly": "true",
+            "tpTriggerPx": _round_tick(tp_price),
+            "tpOrdPx": "-1",                 # market on trigger
+            "tpTriggerPxType": trigger_type,
+            "slTriggerPx": _round_tick(sl_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": trigger_type,
+        }
+        try:
+            payload = request("POST", "/api/v5/trade/order-algo", self.creds, body=body)
+            algo_id = (payload.get("data") or [{}])[0].get("algoId") or ""
+            log.info(
+                "[%s %s] OCO placed algo=%s tp=%s sl=%s",
+                inst_id, pos_side, algo_id, body["tpTriggerPx"], body["slTriggerPx"],
+            )
+            return algo_id or None
+        except Exception as e:
+            # 51250 (price out of range) often clears with mark-price triggers
+            if "51250" in str(e) and trigger_type == "last":
+                log.info("[%s %s] OCO retry with mark-price trigger", inst_id, pos_side)
+                body["tpTriggerPxType"] = "mark"
+                body["slTriggerPxType"] = "mark"
+                try:
+                    payload = request("POST", "/api/v5/trade/order-algo", self.creds, body=body)
+                    algo_id = (payload.get("data") or [{}])[0].get("algoId") or ""
+                    log.info("[%s %s] OCO placed (mark) algo=%s", inst_id, pos_side, algo_id)
+                    return algo_id or None
+                except Exception as e2:
+                    log.warning("[%s %s] OCO TP/SL retry FAILED: %s", inst_id, pos_side, e2)
+                    return None
+            log.warning("[%s %s] OCO TP/SL placement FAILED: %s", inst_id, pos_side, e)
+            return None
+
+    def _cancel_algo(self, symbol: str, algo_id: str) -> bool:
+        if not algo_id:
+            return True
+        inst_id = self._swap_inst_id(symbol)
+        try:
+            request(
+                "POST", "/api/v5/trade/cancel-algos",
+                self.creds, body=[{"algoId": algo_id, "instId": inst_id}],
+            )
+            log.info("[%s] cancelled algo %s", inst_id, algo_id)
+            return True
+        except Exception as e:
+            # 51400 = algo already cancelled / triggered — fine
+            log.info("[%s] algo cancel returned: %s (assuming already gone)", inst_id, e)
+            return False
 
     def _place_market(self, symbol: str, side: str, pos_side: str, contracts: int) -> dict:
         inst_id = self._swap_inst_id(symbol)
@@ -237,16 +338,20 @@ class OkxSwapBroker:
         self._save()
 
     def position_size(self, equity: float, entry: float, stop: float, leverage: int = 1) -> float:
-        """Base-currency units before contract rounding. Risk stays capped by
-        stop distance regardless of leverage; leverage only widens the cap."""
+        """Base-currency units before contract rounding.
+
+        Available cash is shrunk by `margin_buffer` to leave headroom for
+        maintenance margin, fees, and unrealized PnL on existing positions.
+        """
         risk_quote = equity * self.state.risk_per_trade
         per_unit = abs(entry - stop)
         if per_unit <= 0:
             return 0.0
         lev = max(1, int(leverage))
+        usable_cash = max(0.0, self.state.cash * self.margin_buffer)
         units_by_risk = risk_quote / per_unit
         units_by_cap = (equity * self.state.max_position_pct * lev) / entry
-        units_by_cash = (self.state.cash * lev) / entry
+        units_by_cash = (usable_cash * lev) / entry
         return max(0.0, min(units_by_risk, units_by_cap, units_by_cash))
 
     def open(
@@ -262,6 +367,9 @@ class OkxSwapBroker:
     ) -> Optional[LivePosition]:
         if symbol in self.state.positions:
             return None
+        if self._margin_exhausted:
+            log.info("[%s] skipping new entry — margin exhausted this tick", symbol)
+            return None
         lev = max(1, int(leverage))
         pos_side = "long" if direction == 1 else "short"
         order_side = "buy" if direction == 1 else "sell"
@@ -273,11 +381,30 @@ class OkxSwapBroker:
         if contracts <= 0:
             log.info("[%s] swap size %.6f base -> 0 contracts, skipping", symbol, units_raw)
             return None
-        fill = self._place_market(symbol, order_side, pos_side, contracts)
+        try:
+            fill = self._place_market(symbol, order_side, pos_side, contracts)
+        except RuntimeError as e:
+            # OKX 51008 = insufficient margin/USDT balance — no point trying
+            # more new entries this tick. Pull a fresh balance for next tick.
+            if "51008" in str(e):
+                self._margin_exhausted = True
+                log.warning("[%s] MARGIN EXHAUSTED (51008) — skipping further opens this tick", symbol)
+                return None
+            raise
         entry_price = fill["avg_px"] or price
         units = self._units_from_contracts(symbol, contracts)
         notional = units * entry_price
         margin = notional / lev
+
+        # Place exchange-side TP/SL so they survive bot downtime / fast moves.
+        algo_id = self._place_oco_tp_sl(
+            symbol=symbol,
+            pos_side=pos_side,
+            contracts=contracts,
+            tp_price=target,
+            sl_price=stop,
+        ) or ""
+
         pos = LivePosition(
             id=fill["ord_id"] or str(uuid.uuid4()),
             symbol=symbol,
@@ -291,13 +418,14 @@ class OkxSwapBroker:
             rationale=f"{rationale} | lev={lev}x contracts={contracts}",
             leverage=lev,
             margin_used=margin,
+            algo_id=algo_id,
         )
         self.state.cash -= margin
         self.state.positions[symbol] = pos
         self._save()
         log.info(
-            "[%s] OPENED %s %dx units=%.6f (%d contracts) @ %.4f margin=%.2f",
-            symbol, pos_side.upper(), lev, units, contracts, entry_price, margin,
+            "[%s] OPENED %s %dx units=%.6f (%d contracts) @ %.4f margin=%.2f algo=%s",
+            symbol, pos_side.upper(), lev, units, contracts, entry_price, margin, algo_id or "NONE",
         )
         return pos
 
@@ -305,6 +433,10 @@ class OkxSwapBroker:
         pos = self.state.positions.get(symbol)
         if pos is None:
             return None
+        # Cancel the resting OCO TP/SL first — otherwise it would fire on
+        # whatever happens after our close and accidentally re-open us.
+        if pos.algo_id:
+            self._cancel_algo(symbol, pos.algo_id)
         pos_side = "long" if pos.direction == 1 else "short"
         # closing: opposite side, same posSide
         order_side = "sell" if pos.direction == 1 else "buy"
@@ -342,6 +474,180 @@ class OkxSwapBroker:
             symbol, pos_side.upper(), exit_price, reason, pnl, pnl_pct * 100,
         )
         return trade
+
+    # ---- trailing stop ---------------------------------------------------
+    def _get_mark(self, symbol: str) -> Optional[float]:
+        inst_id = self._swap_inst_id(symbol)
+        try:
+            r = requests.get(
+                f"{OKX_BASE}/api/v5/market/ticker",
+                params={"instId": inst_id}, timeout=10,
+            )
+            r.raise_for_status()
+            data = (r.json().get("data") or [{}])[0]
+            return float(data.get("last") or data.get("markPx") or 0) or None
+        except Exception:
+            return None
+
+    def _clamp_levels(self, direction: int, stop: float, target: float,
+                      mark: float, max_dev: float = 0.18):
+        """Force stop/target to lie within ±max_dev of the current mark and
+        on the correct side of it. Required because OKX rejects OCO triggers
+        outside ~25% of the mark (51250).
+        """
+        if mark <= 0:
+            return stop, target
+        if direction == 1:                       # long
+            stop = max(stop, mark * (1 - max_dev))
+            stop = min(stop, mark * 0.999)
+            target = min(target, mark * (1 + max_dev))
+            target = max(target, mark * 1.001)
+        else:                                    # short
+            stop = min(stop, mark * (1 + max_dev))
+            stop = max(stop, mark * 1.001)
+            target = max(target, mark * (1 - max_dev))
+            target = min(target, mark * 0.999)
+        return stop, target
+
+    def update_stop(self, symbol: str, new_stop: float) -> bool:
+        """Place / replace the position's exchange-side OCO with a fresh
+        TP+SL pair. Used for both orphan adoption (no prior algo) and
+        trailing ratchet. Levels are clamped relative to the current mark
+        so OKX won't reject them with 51250.
+        """
+        pos = self.state.positions.get(symbol)
+        if pos is None:
+            return False
+        pos_side = "long" if pos.direction == 1 else "short"
+        contracts = self._contracts_from_units(symbol, pos.size_units)
+        if contracts <= 0:
+            log.warning("[%s] update_stop: 0 contracts, skipping", symbol)
+            return False
+
+        mark = self._get_mark(symbol) or pos.entry_price
+        clamped_stop, clamped_target = self._clamp_levels(
+            pos.direction, new_stop, pos.target, mark,
+        )
+        had_algo = bool(pos.algo_id)
+        if had_algo:
+            self._cancel_algo(symbol, pos.algo_id)
+        new_algo = self._place_oco_tp_sl(
+            symbol=symbol,
+            pos_side=pos_side,
+            contracts=contracts,
+            tp_price=clamped_target,
+            sl_price=clamped_stop,
+        )
+        if new_algo is None:
+            note = "OCO REPLACE FAILED — position is now NAKED" if had_algo \
+                else "ORPHAN ADOPTION FAILED — position remains UNPROTECTED"
+            log.warning("[%s] %s (mark=%.6f stop=%.6f tgt=%.6f)",
+                        symbol, note, mark, clamped_stop, clamped_target)
+            pos.algo_id = ""
+            self._save()
+            return False
+        pos.stop = clamped_stop
+        pos.target = clamped_target
+        pos.algo_id = new_algo
+        pos.trailing_active = True
+        self._save()
+        log.info(
+            "[%s] OCO placed algo=%s tp=%.6f sl=%.6f (mark=%.6f)",
+            symbol, new_algo, clamped_target, clamped_stop, mark,
+        )
+        return True
+
+    # ---- reconciliation --------------------------------------------------
+    def reconcile_exchange(self, marks: Dict[str, float]) -> List[LiveTrade]:
+        """Detect positions closed on the exchange (TP/SL fired, manual close,
+        liquidation) and update local state to match.
+
+        Called at the start of each tick. Returns the list of newly-closed
+        trades so the caller can log them.
+        """
+        try:
+            payload = request("GET", "/api/v5/account/positions", self.creds, params={"instType": "SWAP"})
+        except Exception as e:
+            log.warning("reconcile failed (skipping): %s", e)
+            return []
+        live = (payload.get("data") or [])
+        # OKX returns positions keyed by (instId, posSide); pos == 0 means flat
+        live_set: Dict[str, float] = {}
+        for p in live:
+            inst = p.get("instId", "")
+            pos_qty = float(p.get("pos") or 0)
+            if pos_qty != 0:
+                live_set[inst] = pos_qty
+
+        closed_now: List[LiveTrade] = []
+        for sym in list(self.state.positions.keys()):
+            pos = self.state.positions[sym]
+            inst_id = self._swap_inst_id(sym)
+            if inst_id not in live_set:
+                # exchange says we're flat — TP/SL fired or got liquidated
+                exit_price = marks.get(sym, pos.entry_price)
+                # try to fetch the algo's actual fill price for accuracy
+                algo_fill = self._fetch_algo_fill_price(sym, pos.algo_id) if pos.algo_id else None
+                if algo_fill is not None:
+                    exit_price = algo_fill
+                pnl = pos.direction * (exit_price - pos.entry_price) * pos.size_units
+                margin = pos.margin_used or pos.notional
+                pnl_pct = pnl / margin if margin > 0 else 0.0
+                # decide TP vs SL by which side of entry the fill was
+                if pos.direction == 1:
+                    reason = "tp_hit" if exit_price >= pos.entry_price else "sl_hit"
+                else:
+                    reason = "tp_hit" if exit_price <= pos.entry_price else "sl_hit"
+                trade = LiveTrade(
+                    id=pos.id,
+                    symbol=pos.symbol,
+                    direction=pos.direction,
+                    entry_ts=pos.entry_ts,
+                    exit_ts=_now_iso(),
+                    entry_price=pos.entry_price,
+                    exit_price=exit_price,
+                    size_units=pos.size_units,
+                    pnl_quote=pnl,
+                    pnl_pct=pnl_pct,
+                    exit_reason=reason,
+                    rationale=pos.rationale + " | EXCHANGE-CLOSED",
+                )
+                self.state.cash += margin + pnl
+                del self.state.positions[sym]
+                self.state.closed_trades.append(trade)
+                closed_now.append(trade)
+                log.info(
+                    "[%s] RECONCILED %s @ %.4f reason=%s pnl=%+.2f",
+                    sym, "LONG" if pos.direction == 1 else "SHORT",
+                    exit_price, reason, pnl,
+                )
+        if closed_now:
+            self._save()
+        return closed_now
+
+    def _fetch_algo_fill_price(self, symbol: str, algo_id: str) -> Optional[float]:
+        if not algo_id:
+            return None
+        inst_id = self._swap_inst_id(symbol)
+        try:
+            payload = request(
+                "GET", "/api/v5/trade/orders-algo-history",
+                self.creds, params={"instType": "SWAP", "algoId": algo_id, "ordType": "oco"},
+            )
+            data = payload.get("data") or []
+            if not data:
+                return None
+            d = data[0]
+            # whichever side fired, OKX populates fillPx on the corresponding order
+            for k in ("actualPx", "tpOrdPx", "slOrdPx"):
+                if d.get(k) and d.get(k) not in ("", "-1"):
+                    try:
+                        return float(d[k])
+                    except (TypeError, ValueError):
+                        pass
+        except Exception as e:
+            log.info("[%s] algo history fetch failed: %s", inst_id, e)
+        return None
 
     def reset(self, starting_equity: Optional[float] = None):
         self.state = PortfolioState(

@@ -19,6 +19,9 @@ class AgentParams:
     # leverage sizing — only used by futures/swap brokers; spot ignores these
     max_leverage: int = 5
     leverage_vol_ref_pct: float = 0.02   # ATR/price regarded as "normal"
+    # trailing-stop knobs — tunable by the optimizer
+    trail_activation_r: float = 1.0      # activate trailing once profit ≥ this × initial risk
+    trail_distance_atr: float = 1.5      # trail this × ATR behind the favorable extreme
 
     def normalized(self) -> "AgentParams":
         """Force weights to sum to 1.0 so the decision agent's weighted

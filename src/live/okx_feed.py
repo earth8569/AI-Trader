@@ -19,20 +19,36 @@ def symbol_to_okx(symbol: str, kind: str = "spot") -> str:
 
 
 class OkxFeed:
-    def __init__(self, timeout: float = 15.0):
+    """OKX public market data feed.
+
+    `kind` decides which OKX product the symbol resolves to:
+      - "spot" → BTC-USDT (default; also covers stock symbols only available as swap, see fallback)
+      - "swap" → BTC-USDT-SWAP (required for stock-perpetual tickers like TSLA, NVDA, etc.)
+    """
+
+    def __init__(self, timeout: float = 15.0, kind: str = "spot"):
         self.timeout = timeout
+        self.kind = kind
+
+    def _resolve_inst(self, instrument: str) -> str:
+        # Stock-perpetual tickers only exist on SWAP — auto-switch even in spot mode
+        base = instrument.split("_")[0].upper()
+        stock_tickers = {"TSLA","NVDA","GOOGL","AAPL","MSFT","AMZN","META","NFLX","AMD","SPY","QQQ"}
+        if base in stock_tickers:
+            return symbol_to_okx(instrument, kind="swap")
+        return symbol_to_okx(instrument, kind=self.kind)
 
     def get_candles(self, instrument: str, timeframe: str, count: int = 300) -> pd.DataFrame:
         bar = OKX_BAR.get(timeframe)
         if bar is None:
             raise ValueError(f"unsupported timeframe {timeframe}")
-        inst_id = symbol_to_okx(instrument)
+        inst_id = self._resolve_inst(instrument)
         params = {"instId": inst_id, "bar": bar, "limit": min(count, 300)}
         r = requests.get(f"{OKX_BASE}/api/v5/market/candles", params=params, timeout=self.timeout)
         r.raise_for_status()
         payload = r.json()
         if str(payload.get("code")) != "0":
-            raise RuntimeError(f"OKX candles error: {payload}")
+            raise RuntimeError(f"OKX candles error for {inst_id}: {payload}")
         rows = payload.get("data") or []
         if not rows:
             raise RuntimeError(f"no candles for {inst_id}")
@@ -52,7 +68,7 @@ class OkxFeed:
         return df
 
     def get_ticker(self, instrument: str) -> dict:
-        inst_id = symbol_to_okx(instrument)
+        inst_id = self._resolve_inst(instrument)
         r = requests.get(
             f"{OKX_BASE}/api/v5/market/ticker",
             params={"instId": inst_id},

@@ -40,6 +40,9 @@ DEFAULT_SPACE: Dict[str, List[float]] = {
     "risk_veto":         [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3],
     "atr_mult_stop":     [1.0, 1.5, 2.0, 2.5, 3.0],
     "atr_mult_target":   [2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0],
+    # trailing stop knobs — learned alongside the entry/exit thresholds
+    "trail_activation_r": [0.5, 0.75, 1.0, 1.5, 2.0],
+    "trail_distance_atr": [0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
 }
 
 

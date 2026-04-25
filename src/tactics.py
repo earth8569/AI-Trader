@@ -49,6 +49,55 @@ def _pick_leverage(conviction: float, atr_pct: float, params: AgentParams) -> in
     return max(1, min(params.max_leverage, int(round(raw))))
 
 
+def compute_trailing_update(pos, mark: float, atr: float, params: AgentParams):
+    """Decide if the position's stop should ratchet to a tighter level.
+
+    Returns (new_stop or None, updated_extreme). The trader writes
+    `updated_extreme` into the position's high/low water mark on every tick;
+    `new_stop` is non-None only when the trail would actually tighten the
+    stop AND keep it at-or-better than breakeven.
+
+    Ratchet rule: stops only move in the favor direction (locks profit).
+    Once activated, stop is forced to ≥ entry (long) / ≤ entry (short),
+    so the trade is at worst risk-free.
+    """
+    if atr <= 0 or atr != atr:  # NaN guard
+        return None, pos.high_water_mark or pos.low_water_mark or pos.entry_price
+
+    direction = pos.direction
+    initial_risk = abs(pos.entry_price - pos.stop)
+    if initial_risk <= 0:
+        return None, pos.high_water_mark or pos.low_water_mark or pos.entry_price
+
+    # update favorable extreme
+    if direction == 1:
+        prev_extreme = pos.high_water_mark if pos.high_water_mark > 0 else pos.entry_price
+        extreme = max(prev_extreme, mark)
+    else:
+        prev_extreme = pos.low_water_mark if pos.low_water_mark > 0 else pos.entry_price
+        extreme = min(prev_extreme, mark) if prev_extreme > 0 else mark
+
+    # has unrealized profit reached the activation threshold?
+    profit = direction * (extreme - pos.entry_price)
+    if profit < params.trail_activation_r * initial_risk:
+        return None, extreme
+
+    # propose a new stop based on the trail distance behind the extreme
+    trail = params.trail_distance_atr * atr
+    if direction == 1:
+        candidate = extreme - trail
+        # only ever tighten, and at minimum lock breakeven once active
+        candidate = max(candidate, pos.entry_price)
+        if candidate > pos.stop * 1.0001:           # require meaningful move
+            return candidate, extreme
+    else:
+        candidate = extreme + trail
+        candidate = min(candidate, pos.entry_price)
+        if candidate < pos.stop * 0.9999:
+            return candidate, extreme
+    return None, extreme
+
+
 def plan_position(
     row,
     symbol: str,
@@ -103,6 +152,19 @@ def plan_position(
         target_raw = price - r_ratio * risk_per_unit
         target = max(target_raw, bb_lo - 0.5 * atr)
         target = min(target, price - 1.5 * risk_per_unit)
+
+    # OKX rejects OCO triggers outside ~25% of mark; cap target/stop to ±20%
+    # to stay safely within range while preserving the agent's intent.
+    max_dev = 0.20
+    if direction == 1:
+        target = min(target, price * (1 + max_dev))
+        stop = max(stop, price * (1 - max_dev))
+    else:
+        target = max(target, price * (1 - max_dev))
+        stop = min(stop, price * (1 + max_dev))
+    risk_per_unit = abs(price - stop)
+    if risk_per_unit <= 0:
+        return None
 
     realized_r = abs(target - price) / risk_per_unit
 

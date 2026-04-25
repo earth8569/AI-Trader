@@ -63,7 +63,10 @@ def _make_broker(cfg: dict):
 def _make_feed(cfg: dict):
     kind = cfg.get("feed", "cryptocom").lower()
     if kind == "okx":
-        return OkxFeed()
+        # if we're trading swaps, prefer swap candles (closer to swap mark price)
+        broker_kind = cfg.get("broker", "paper").lower()
+        feed_kind = "swap" if broker_kind in ("okx_swap", "okx-swap", "okxswap") else "spot"
+        return OkxFeed(kind=feed_kind)
     return LiveFeed()
 
 

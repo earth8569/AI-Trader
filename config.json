@@ -1,7 +1,14 @@
 {
   "broker": "okx_swap",
   "feed": "okx",
-  "symbols": ["BTC_USDT", "ETH_USDT", "SOL_USDT", "DOGE_USDT", "XRP_USDT", "LINK_USDT", "AVAX_USDT"],
+  "symbols": [
+    "BTC_USDT", "ETH_USDT", "SOL_USDT", "BNB_USDT", "XRP_USDT", "DOGE_USDT", "AVAX_USDT",
+    "ADA_USDT", "DOT_USDT", "LTC_USDT", "BCH_USDT", "TRX_USDT", "LINK_USDT",
+    "ATOM_USDT", "NEAR_USDT", "ARB_USDT", "OP_USDT", "FIL_USDT", "INJ_USDT",
+    "SUI_USDT", "TON_USDT", "PEPE_USDT", "SHIB_USDT", "HBAR_USDT", "ALGO_USDT",
+    "XLM_USDT", "CHZ_USDT", "SAND_USDT", "AXS_USDT", "CRV_USDT", "ENA_USDT", "GMT_USDT",
+    "TSLA_USDT", "NVDA_USDT", "GOOGL_USDT", "AAPL_USDT", "MSFT_USDT", "SPY_USDT"
+  ],
   "timeframe": "1h",
   "candle_count": 300,
   "max_hold_bars": 96,
@@ -20,7 +27,7 @@
   "okx_quote_ccy": "USDT",
   "log_path": "logs/trader.log",
   "params_path": "state/best_params.json",
-  "optimize_symbols": [],
+  "optimize_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"],
   "optimize_interval": "1h",
   "optimize_lookback_days": 180,
   "optimize_samples": 60,

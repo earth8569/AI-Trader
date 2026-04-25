@@ -16,8 +16,9 @@ import pandas as pd
 
 from ..agents import DecisionAgent, RiskAgent, SentimentAgent, TechnicalAgent
 from ..indicators import enrich
+from ..logging_setup import banner, GREEN, RED, YELLOW, CYAN, GRAY, RESET
 from ..params import AgentParams, load_best
-from ..tactics import plan_position
+from ..tactics import compute_trailing_update, plan_position
 from .broker_base import BrokerBase
 from .data_feed import LiveFeed
 
@@ -127,28 +128,68 @@ class LiveTrader:
     def tick(self) -> dict:
         marks: Dict[str, float] = {}
         actions: List[dict] = []
+        errors: List[str] = []
+        # tick header — one short line, easy to scan
+        ts = pd.Timestamp.utcnow().strftime("%H:%M:%S")
+        print(banner(f"TICK {ts}  symbols={len(self.cfg.symbols)}"))
+
+        # 1. refresh broker-side balance + reconcile exchange-fired exits
+        #    (TP/SL/liquidation) before we look at signals.
+        if hasattr(self.broker, "refresh_balance"):
+            try:
+                self.broker.refresh_balance()
+            except Exception as e:
+                log.warning("balance refresh FAILED: %s", e)
+                errors.append(f"refresh: {e}")
+        if hasattr(self.broker, "reconcile_exchange"):
+            try:
+                self.broker.reconcile_exchange({})
+            except Exception as e:
+                log.warning("reconcile FAILED: %s", e)
+                errors.append(f"reconcile: {e}")
+
         for sym in self.cfg.symbols:
             try:
                 info = self._tick_symbol(sym)
             except Exception as e:
-                log.exception("tick failed for %s: %s", sym, e)
+                log.error("[%s] FAILED: %s", sym, e)
+                errors.append(f"{sym}: {e}")
                 continue
             marks[sym] = info["mark"]
             actions.append(info)
         if marks:
             self.broker.record_equity(marks)
+
+        equity = self.broker.equity(marks)
+        starting = self.broker.starting_equity or 1.0
+        ret_pct = (equity / starting - 1.0) * 100
         summary = {
             "ts": pd.Timestamp.utcnow().isoformat(),
-            "equity": self.broker.equity(marks),
+            "equity": equity,
             "cash": self.broker.cash,
             "open_positions": len(self.broker.open_positions),
             "closed_trades": len(self.broker.closed_trades),
             "actions": actions,
+            "errors": errors,
         }
-        log.info(
-            "tick equity=%.2f cash=%.2f open=%d closed=%d",
-            summary["equity"], summary["cash"],
-            summary["open_positions"], summary["closed_trades"],
+        # build a one-line summary, color-coded by error count
+        opens = sum(1 for a in actions if a.get("status", "").startswith("OPEN_"))
+        closes = sum(1 for a in actions if a.get("status", "").startswith("CLOSE_"))
+        ret_color = GREEN if ret_pct >= 0 else RED
+        err_seg = f"{RED}err={len(errors)}{RESET}" if errors else f"{GRAY}err=0{RESET}"
+        print(
+            f"{GRAY}{ts}{RESET} {CYAN}|{RESET} "
+            f"equity={equity:,.2f} ({ret_color}{ret_pct:+.2f}%{RESET}) {CYAN}|{RESET} "
+            f"cash={self.broker.cash:,.2f} {CYAN}|{RESET} "
+            f"open={summary['open_positions']} {CYAN}|{RESET} "
+            f"opened={opens} closed={closes} {CYAN}|{RESET} "
+            f"{err_seg}"
+        )
+        # full machine-readable line goes to file only
+        log.debug(
+            "tick summary equity=%.2f cash=%.2f open=%d closed=%d opened=%d closed_now=%d errors=%d",
+            equity, self.broker.cash, summary["open_positions"],
+            summary["closed_trades"], opens, closes, len(errors),
         )
         return summary
 
@@ -160,7 +201,7 @@ class LiveTrader:
             subset=["sma_slow", "rsi", "macd_hist", "atr", "bb_pct", "vol_ratio", "ret_5"]
         ).reset_index(drop=True)
         if df.empty:
-            log.warning("%s: not enough bars yet", symbol)
+            log.debug("%s: not enough bars yet", symbol)
             return {"symbol": symbol, "status": "insufficient_data", "mark": 0.0}
 
         row = df.iloc[-1]
@@ -174,6 +215,42 @@ class LiveTrader:
             bars_held = self._bar_counter.get(symbol, 0) + 1
             self._bar_counter[symbol] = bars_held
             high, low = float(row["high"]), float(row["low"])
+
+            # 1a. Adopt orphans + run trailing ratchet — one update_stop call.
+            #
+            # An "orphan" is an open position with no exchange-side OCO
+            # (algo_id == ""), typically because it was opened before the
+            # OCO feature existed or because OCO placement failed earlier.
+            # On EVERY tick we want such positions protected: place an OCO
+            # using the stored stop+target. If trailing also wants to
+            # tighten the stop, fold both into one cancel+replace.
+            atr = float(row["atr"])
+            new_stop, extreme = compute_trailing_update(pos, mark, atr, self.params)
+            # water marks update every tick (in-memory; persists when broker saves)
+            if pos.direction == 1:
+                pos.high_water_mark = extreme
+            else:
+                pos.low_water_mark = extreme
+
+            needs_protect = not pos.algo_id
+            trail_tightened = new_stop is not None
+            if (needs_protect or trail_tightened) and hasattr(self.broker, "update_stop"):
+                old_stop = pos.stop
+                target_stop = new_stop if trail_tightened else pos.stop
+                if self.broker.update_stop(symbol, target_stop):
+                    if trail_tightened:
+                        log.info(
+                            "[%s] TRAIL stop %.6f -> %.6f (extreme=%.6f, mark=%.6f)",
+                            symbol, old_stop, target_stop, extreme, mark,
+                        )
+                    else:
+                        log.info(
+                            "[%s] PROTECTED orphan with OCO stop=%.6f tgt=%.6f",
+                            symbol, target_stop, pos.target,
+                        )
+                    pos = self.broker.open_positions.get(symbol)
+                    if pos is None:
+                        return {"symbol": symbol, "status": "TRAILED", "detail": "", "mark": mark}
             hit_stop = (pos.direction == 1 and low <= pos.stop) or (
                 pos.direction == -1 and high >= pos.stop
             )

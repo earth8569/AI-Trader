@@ -64,7 +64,11 @@ class OkxSwapBroker:
         self._inst_cache: Dict[str, dict] = {}
         self._lev_cache: Dict[tuple, int] = {}   # (instId, posSide) -> lever
         self._margin_exhausted: bool = False     # set by 51008, reset each tick
+        self.active_params_hash: str = ""
         self.state = self._load()
+
+    def set_active_params_hash(self, h: str) -> None:
+        self.active_params_hash = h or ""
         if not self.creds.demo:
             log.warning("OkxSwapBroker running in LIVE mode — real money + leverage at risk")
         else:
@@ -419,6 +423,7 @@ class OkxSwapBroker:
             leverage=lev,
             margin_used=margin,
             algo_id=algo_id,
+            params_hash=self.active_params_hash,
         )
         self.state.cash -= margin
         self.state.positions[symbol] = pos
@@ -464,6 +469,8 @@ class OkxSwapBroker:
             pnl_pct=pnl_pct,
             exit_reason=reason,
             rationale=pos.rationale,
+            leverage=pos.leverage,
+            params_hash=pos.params_hash,
         )
         self.state.cash += margin + pnl
         del self.state.positions[symbol]
@@ -584,12 +591,20 @@ class OkxSwapBroker:
             pos = self.state.positions[sym]
             inst_id = self._swap_inst_id(sym)
             if inst_id not in live_set:
-                # exchange says we're flat — TP/SL fired or got liquidated
-                exit_price = marks.get(sym, pos.entry_price)
-                # try to fetch the algo's actual fill price for accuracy
+                # exchange says we're flat — TP/SL fired or got liquidated.
+                # Resolve exit_price in priority order:
+                #   1. algo fill price (most accurate — exact OCO fill)
+                #   2. caller-supplied mark
+                #   3. live ticker (closest available substitute)
+                #   4. entry_price (last resort — produces 0 PnL, marker of failure)
                 algo_fill = self._fetch_algo_fill_price(sym, pos.algo_id) if pos.algo_id else None
                 if algo_fill is not None:
                     exit_price = algo_fill
+                elif sym in marks and marks[sym] > 0:
+                    exit_price = marks[sym]
+                else:
+                    live_mark = self._get_mark(sym)
+                    exit_price = live_mark if live_mark and live_mark > 0 else pos.entry_price
                 pnl = pos.direction * (exit_price - pos.entry_price) * pos.size_units
                 margin = pos.margin_used or pos.notional
                 pnl_pct = pnl / margin if margin > 0 else 0.0
@@ -611,6 +626,8 @@ class OkxSwapBroker:
                     pnl_pct=pnl_pct,
                     exit_reason=reason,
                     rationale=pos.rationale + " | EXCHANGE-CLOSED",
+                    leverage=pos.leverage,
+                    params_hash=pos.params_hash,
                 )
                 self.state.cash += margin + pnl
                 del self.state.positions[sym]

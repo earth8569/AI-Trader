@@ -50,6 +50,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["sma_fast"] = sma(out["close"], 20)
     out["sma_slow"] = sma(out["close"], 50)
+    out["sma_200"]  = sma(out["close"], 200)   # macro-trend reference
     out["ema_fast"] = ema(out["close"], 12)
     out["ema_slow"] = ema(out["close"], 26)
     out["rsi"] = rsi(out["close"], 14)

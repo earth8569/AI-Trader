@@ -10,8 +10,9 @@ from typing import List, Optional
 
 @dataclass
 class AgentParams:
-    technical_weight: float = 0.55
-    sentiment_weight: float = 0.45
+    technical_weight: float = 0.45
+    sentiment_weight: float = 0.35
+    market_intel_weight: float = 0.20      # funding-rate contrarian voter
     entry_threshold: float = 0.35
     risk_veto: float = -0.6
     atr_mult_stop: float = 2.0
@@ -20,19 +21,27 @@ class AgentParams:
     max_leverage: int = 5
     leverage_vol_ref_pct: float = 0.02   # ATR/price regarded as "normal"
     # trailing-stop knobs — tunable by the optimizer
-    trail_activation_r: float = 1.0      # activate trailing once profit ≥ this × initial risk
-    trail_distance_atr: float = 1.5      # trail this × ATR behind the favorable extreme
+    # Trail late + wide so the rare 5-10R outlier moves keep going. The
+    # strategy makes its year on those — tight trailing kills the tail.
+    trail_activation_r: float = 3.0
+    trail_distance_atr: float = 3.0
 
     def normalized(self) -> "AgentParams":
-        """Force weights to sum to 1.0 so the decision agent's weighted
-        average remains on the same scale regardless of grid choices."""
-        s = self.technical_weight + self.sentiment_weight
+        """Force voter weights to sum to 1.0 so DecisionAgent's weighted
+        average stays on the same scale regardless of grid choices."""
+        s = self.technical_weight + self.sentiment_weight + self.market_intel_weight
         if s <= 0:
-            return replace(self, technical_weight=0.5, sentiment_weight=0.5)
+            return replace(
+                self,
+                technical_weight=0.45,
+                sentiment_weight=0.35,
+                market_intel_weight=0.20,
+            )
         return replace(
             self,
             technical_weight=self.technical_weight / s,
             sentiment_weight=self.sentiment_weight / s,
+            market_intel_weight=self.market_intel_weight / s,
         )
 
     def to_dict(self) -> dict:

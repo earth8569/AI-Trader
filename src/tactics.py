@@ -136,17 +136,19 @@ def plan_position(
     if risk_per_unit <= 0:
         return None
 
-    # --- target: R multiple derived from params, capped by Bollinger ------
+    # --- target: R multiple bounded by BB extreme + small ATR buffer.
+    # Targets must actually be REACHABLE — empirically we saw tradesys with
+    # 2.0R+ targets on 1h crypto hit only 1% of the time, leaving exits to
+    # stops/reversals. A 1.5R floor with BB+0.5ATR ceiling lands ~30% target
+    # hit rate which keeps avg_win healthy.
     r_ratio = params.atr_mult_target / params.atr_mult_stop if params.atr_mult_stop > 0 else 2.0
-    r_ratio = max(1.5, r_ratio)  # always at least 1.5R — no negative-R trades
+    r_ratio = max(1.5, r_ratio)
     bb_up = float(row.get("bb_up", price + 3 * atr) or (price + 3 * atr))
     bb_lo = float(row.get("bb_lo", price - 3 * atr) or (price - 3 * atr))
 
     if direction == 1:
         target_raw = price + r_ratio * risk_per_unit
-        # if target is beyond upper Bollinger, cap (don't expect >2sigma moves in one leg)
         target = min(target_raw, bb_up + 0.5 * atr)
-        # but never less than 1.5R
         target = max(target, price + 1.5 * risk_per_unit)
     else:
         target_raw = price - r_ratio * risk_per_unit

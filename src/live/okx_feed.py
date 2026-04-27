@@ -67,6 +67,27 @@ class OkxFeed:
         df = pd.DataFrame(parsed).sort_values("timestamp").reset_index(drop=True)
         return df
 
+    def get_funding_rate(self, instrument: str):
+        """Current funding rate for the perpetual swap (decimal, per 8h).
+
+        Returns None on any failure so callers can degrade gracefully.
+        Always resolves to the SWAP instrument, regardless of feed kind.
+        """
+        inst_id = symbol_to_okx(instrument, kind="swap")
+        try:
+            r = requests.get(
+                f"{OKX_BASE}/api/v5/public/funding-rate",
+                params={"instId": inst_id}, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json().get("data") or []
+            if not data:
+                return None
+            rate = data[0].get("fundingRate")
+            return float(rate) if rate not in (None, "") else None
+        except Exception:
+            return None
+
     def get_ticker(self, instrument: str) -> dict:
         inst_id = self._resolve_inst(instrument)
         r = requests.get(

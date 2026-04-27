@@ -14,7 +14,7 @@ from typing import Dict, List
 
 import pandas as pd
 
-from ..agents import DecisionAgent, RiskAgent, SentimentAgent, TechnicalAgent
+from ..agents import DecisionAgent, MarketIntelAgent, RiskAgent, SentimentAgent, TechnicalAgent
 from ..indicators import enrich
 from ..logging_setup import banner, GREEN, RED, YELLOW, CYAN, GRAY, RESET
 from ..params import AgentParams, load_best
@@ -71,6 +71,13 @@ class LiveTrader:
         self._bar_counter: Dict[str, int] = {}
 
     # ---- agent construction / hot-reload --------------------------------
+    def _params_hash(self, p: AgentParams) -> str:
+        import hashlib, json
+        h = hashlib.sha256(
+            json.dumps(p.to_dict(), sort_keys=True).encode()
+        ).hexdigest()[:8]
+        return h
+
     def _rebuild_agents(self, p: AgentParams):
         self.technical = TechnicalAgent()
         self.sentiment = SentimentAgent()
@@ -78,11 +85,24 @@ class LiveTrader:
             atr_mult_stop=p.atr_mult_stop,
             atr_mult_target=p.atr_mult_target,
         )
+        # MarketIntel uses the live feed's funding-rate fetcher when available.
+        # In paper/backtest contexts where feed has no funding endpoint, the
+        # agent simply returns confidence=0 and the decision re-weights without it.
+        funding_fetcher = getattr(self.feed, "get_funding_rate", None) if self.feed else None
+        self.market_intel = MarketIntelAgent(fetcher=funding_fetcher)
         self.decision = DecisionAgent(
-            weights={"technical": p.technical_weight, "sentiment": p.sentiment_weight},
+            weights={
+                "technical": p.technical_weight,
+                "sentiment": p.sentiment_weight,
+                "market_intel": p.market_intel_weight,
+            },
             entry_threshold=p.entry_threshold,
             risk_veto=p.risk_veto,
         )
+        # tag every subsequent open with this params hash so the learn
+        # command can attribute wins/losses to specific configs.
+        if hasattr(self.broker, "set_active_params_hash"):
+            self.broker.set_active_params_hash(self._params_hash(p))
 
     def reload_params(self) -> bool:
         """Re-read params file. Returns True if anything changed."""
@@ -267,12 +287,16 @@ class LiveTrader:
             elif bars_held >= self.cfg.max_hold_bars:
                 closed = self.broker.close(symbol, mark, "timeout")
             else:
-                # reversal check via fresh debate
-                sigs = self._debate(row)
-                if (pos.direction == 1 and sigs["decision"].action == "SELL") or (
-                    pos.direction == -1 and sigs["decision"].action == "BUY"
-                ):
-                    closed = self.broker.close(symbol, mark, "reversal")
+                # reversal check — but only if NOT already meaningfully in
+                # profit. Winners are managed by trailing stops; reactively
+                # flipping on the next opposite signal cuts them short.
+                profit_pct = pos.direction * (mark - pos.entry_price) / pos.entry_price
+                if profit_pct < 0.01:
+                    sigs = self._debate(row, symbol=symbol)
+                    if (pos.direction == 1 and sigs["decision"].action == "SELL") or (
+                        pos.direction == -1 and sigs["decision"].action == "BUY"
+                    ):
+                        closed = self.broker.close(symbol, mark, "reversal")
             if closed is not None:
                 self._bar_counter.pop(symbol, None)
                 action = f"CLOSE_{closed.exit_reason.upper()}"
@@ -282,7 +306,7 @@ class LiveTrader:
 
         # --- 2. look for a fresh entry -------------------------------------
         if symbol not in self.broker.open_positions:
-            sigs = self._debate(row)
+            sigs = self._debate(row, symbol=symbol)
             dec = sigs["decision"]
             if dec.action in ("BUY", "SELL") and (dec.action == "BUY" or self.cfg.allow_shorts):
                 direction = 1 if dec.action == "BUY" else -1
@@ -317,12 +341,16 @@ class LiveTrader:
         return {"symbol": symbol, "status": action, "detail": detail, "mark": mark}
 
     # ---- agents debate ---------------------------------------------------
-    def _debate(self, row) -> dict:
+    def _debate(self, row, symbol: str | None = None) -> dict:
         st = self.technical.evaluate(row)
         ss = self.sentiment.evaluate(row)
         sr = self.risk.evaluate(row)
-        dec = self.decision.debate({"technical": st, "sentiment": ss, "risk": sr})
-        return {"technical": st, "sentiment": ss, "risk": sr, "decision": dec}
+        si = self.market_intel.evaluate(row, symbol=symbol)
+        dec = self.decision.debate({
+            "technical": st, "sentiment": ss,
+            "market_intel": si, "risk": sr,
+        })
+        return {"technical": st, "sentiment": ss, "market_intel": si, "risk": sr, "decision": dec}
 
     # ---- daemon loop -----------------------------------------------------
     def run_forever(self, max_ticks: int | None = None):

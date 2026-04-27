@@ -38,6 +38,8 @@ class LivePosition:
     high_water_mark: float = 0.0
     low_water_mark: float = 0.0
     trailing_active: bool = False
+    # short hash of the AgentParams that produced this trade (8 chars)
+    params_hash: str = ""
 
 
 @dataclass
@@ -54,6 +56,8 @@ class LiveTrade:
     pnl_pct: float
     exit_reason: str
     rationale: str = ""
+    leverage: int = 1
+    params_hash: str = ""    # carried from LivePosition for attribution
 
 
 @dataclass
@@ -103,6 +107,10 @@ class PaperBroker:
     def __init__(self, state_path: str | Path = "state/portfolio.json"):
         self.state_path = Path(state_path)
         self.state = self._load()
+        self.active_params_hash: str = ""
+
+    def set_active_params_hash(self, h: str) -> None:
+        self.active_params_hash = h or ""
 
     # ---- protocol accessors ---------------------------------------------
     @property
@@ -208,6 +216,7 @@ class PaperBroker:
             rationale=rationale,
             leverage=lev,
             margin_used=margin,
+            params_hash=self.active_params_hash,
         )
         # in a paper/spot world we lock the whole notional; in a leveraged
         # world we only lock the margin. Use margin here so leverage frees
@@ -239,6 +248,8 @@ class PaperBroker:
             pnl_pct=pnl_pct,
             exit_reason=reason,
             rationale=pos.rationale,
+            leverage=pos.leverage,
+            params_hash=pos.params_hash,
         )
         # release margin + pnl
         self.state.cash += margin + pnl

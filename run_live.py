@@ -187,6 +187,18 @@ def cmd_optimize(args, cfg):
         print(f"\n-- history: {len(full['history'])} prior snapshots retained")
 
 
+def cmd_learn(args, cfg):
+    from src.learn import analyze
+    kind = cfg.get("broker", "paper").lower()
+    if kind in ("okx_swap", "okx-swap", "okxswap"):
+        path = cfg.get("okx_swap_state_path", "state/okx_swap_portfolio.json")
+    elif kind == "okx":
+        path = cfg["okx_state_path"]
+    else:
+        path = cfg["state_path"]
+    print(analyze(path, last_n=args.last))
+
+
 def cmd_params(args, cfg):
     from src.params import load_snapshot
     snap = load_snapshot(cfg.get("params_path", "state/best_params.json"))
@@ -248,6 +260,10 @@ def main(argv=None):
 
     sp = sub.add_parser("params", help="show currently-saved best params")
     sp.set_defaults(func=cmd_params)
+
+    sp = sub.add_parser("learn", help="analyze closed trades — win/loss per dimension")
+    sp.add_argument("--last", type=int, default=None, help="only analyze the last N trades")
+    sp.set_defaults(func=cmd_learn)
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)

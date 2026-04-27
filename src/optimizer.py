@@ -34,15 +34,16 @@ log = logging.getLogger("ai-trader.optimizer")
 # --- search space -----------------------------------------------------------
 # Keep bounded and economical — walk-forward, not a kitchen-sink grid.
 DEFAULT_SPACE: Dict[str, List[float]] = {
-    "technical_weight":  [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
-    "sentiment_weight":  [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
-    "entry_threshold":   [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
-    "risk_veto":         [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3],
-    "atr_mult_stop":     [1.0, 1.5, 2.0, 2.5, 3.0],
-    "atr_mult_target":   [2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0],
+    "technical_weight":     [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
+    "sentiment_weight":     [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
+    "market_intel_weight":  [0.10, 0.15, 0.20, 0.30, 0.40],   # funding-rate voter
+    "entry_threshold":      [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
+    "risk_veto":            [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3],
+    "atr_mult_stop":        [1.0, 1.5, 2.0, 2.5, 3.0],
+    "atr_mult_target":      [2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0],
     # trailing stop knobs — learned alongside the entry/exit thresholds
-    "trail_activation_r": [0.5, 0.75, 1.0, 1.5, 2.0],
-    "trail_distance_atr": [0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
+    "trail_activation_r":   [0.5, 0.75, 1.0, 1.5, 2.0],
+    "trail_distance_atr":   [0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
 }
 
 
